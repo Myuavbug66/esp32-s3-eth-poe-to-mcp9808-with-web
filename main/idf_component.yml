@@ -1,0 +1,2 @@
+dependencies:
+  espressif/w5500: "^2.0.0"

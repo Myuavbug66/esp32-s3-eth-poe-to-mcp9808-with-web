@@ -1,0 +1,72 @@
+menu "Example Configuration"
+
+    orsource "$IDF_PATH/examples/common_components/env_caps/$IDF_TARGET/Kconfig.env_caps"
+
+    config I2C_MASTER_SCL
+        int "SCL GPIO Num"
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_OUT_RANGE_MAX
+        default 15
+        help
+            GPIO number for I2C Master clock line.
+
+    config I2C_MASTER_SDA
+        int "SDA GPIO Num"
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_OUT_RANGE_MAX
+        default 16
+        help
+            GPIO number for I2C Master data line.
+
+    config I2C_MASTER_FREQUENCY
+        int "Master Frequency"
+        default 400000
+        help
+            I2C Speed of Master device.
+
+endmenu
+
+
+menu "PoE Ethernet (W5500) Configuration"
+
+    config ETH_SPI_CLOCK_MHZ
+        int "SPI clock speed (MHz)"
+        default 10
+        help
+            SPI clock frequency used to communicate with the W5500.
+
+    config ETH_SPI_SCLK_GPIO
+        int "SPI SCLK GPIO"
+        default 13
+
+    config ETH_SPI_MOSI_GPIO
+        int "SPI MOSI GPIO"
+        default 11
+
+    config ETH_SPI_MISO_GPIO
+        int "SPI MISO GPIO"
+        default 12
+
+    config ETH_SPI_CS_GPIO
+        int "SPI CS GPIO"
+        default 14
+
+    config ETH_SPI_INT_GPIO
+        int "W5500 INT GPIO"
+        default 10
+
+    config ETH_SPI_RST_GPIO
+        int "W5500 RST GPIO"
+        default 09
+
+    config ETH_STATIC_IP_ADDR
+        string "Static IP address"
+        default "192.168.1.136"
+
+    config ETH_STATIC_GW_ADDR
+        string "Static gateway address"
+        default "192.168.1.1"
+
+    config ETH_STATIC_NETMASK_ADDR
+        string "Static netmask"
+        default "255.255.255.0"
+
+endmenu
