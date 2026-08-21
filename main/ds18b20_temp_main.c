@@ -3,13 +3,13 @@
  *
  * SPDX-License-Identifier: Unlicense OR CC0-1.0
  */
-/* i2c - Simple Example
-
-   Simple I2C example that shows how to initialize I2C
-   as well as reading and writing from and to registers for a sensor connected over I2C.
-
-   The sensor used in this example is a MCP9808 digital temperature sensor.
+/*
+* Temperture pouput String 
+* 458 for monitor
+* 267-289 For WEB
+* 303 for JSON API
 */
+/* ESP32-S3 PoE temperature monitor using a DS18B20 1-Wire sensor. */
 #include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -29,27 +29,19 @@
 #include "esp_eth_mac_w5500.h"
 #include "esp_http_server.h"
 #include "esp_ota_ops.h"
-#include "driver/i2c_master.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
+#include "onewire_bus.h"
+#include "ds18b20.h"
+#include "mdns.h"
+#include "lwip/apps/netbiosns.h"
 
-static const char *TAG = "mcp9808";
+static const char *TAG = "ds18b20";
 
-#define I2C_MASTER_SCL_IO           CONFIG_I2C_MASTER_SCL       /*!< GPIO number used for I2C master clock */
-#define I2C_MASTER_SDA_IO           CONFIG_I2C_MASTER_SDA       /*!< GPIO number used for I2C master data  */
-#define I2C_MASTER_NUM              I2C_NUM_1                   /*!< I2C port number for master dev */
-#define I2C_MASTER_FREQ_HZ          CONFIG_I2C_MASTER_FREQUENCY /*!< I2C master clock frequency */
-#define I2C_MASTER_TX_BUF_DISABLE   0                           /*!< I2C master doesn't need buffer */
-#define I2C_MASTER_RX_BUF_DISABLE   0                           /*!< I2C master doesn't need buffer */
-#define I2C_MASTER_TIMEOUT_MS       1000
-
-#define MCP9808_SENSOR_ADDR         0x18        /*!< Address of the MCP9808 sensor (A2/A1/A0 tied low) */
-#define MCP9808_REG_CONFIG          0x01        /*!< Configuration register */
-#define MCP9808_REG_TEMP_AMBIENT    0x05        /*!< Ambient temperature register */
-#define MCP9808_REG_MANUF_ID        0x06        /*!< Manufacturer ID register */
-#define MCP9808_REG_DEVICE_ID       0x07        /*!< Device ID/revision register */
-#define MCP9808_TEMP_OFFSET_F_DEFAULT  -3.0f    /*!< Default calibration offset added to the Fahrenheit reading */
-#define MCP9808_TEMP_OFFSET_STEP_F     0.1f     /*!< Amount the web UI +/- buttons adjust the offset by */
+#define DEVICE_HOSTNAME             "esp32-s3-eth"
+#define DS18B20_GPIO                CONFIG_DS18B20_GPIO
+#define DS18B20_TEMP_OFFSET_F_DEFAULT  -1.0f
+#define DS18B20_TEMP_OFFSET_STEP_F     0.1f
 #define SAMPLE_INTERVAL_MS          1000        /*!< Time between sensor reads */
 #define SAMPLES_PER_AVERAGE         5           /*!< Number of reads averaged into each logged value (5 sec) */
 
@@ -57,7 +49,7 @@ static const char *TAG = "mcp9808";
  * from the sensor task and read/written from HTTP server request handlers. */
 static SemaphoreHandle_t g_data_mutex;
 static float g_temp_f = 0.0f;
-static float g_offset_f = MCP9808_TEMP_OFFSET_F_DEFAULT;
+static float g_offset_f = DS18B20_TEMP_OFFSET_F_DEFAULT;
 static SemaphoreHandle_t g_telnet_mutex;
 static int g_telnet_client = -1;
 static vprintf_like_t g_usb_vprintf;
@@ -163,60 +155,6 @@ static void start_telnet_server(void)
 }
 
 /**
- * @brief Read a sequence of bytes from a MCP9808 sensor register
- */
-static esp_err_t mcp9808_register_read(i2c_master_dev_handle_t dev_handle, uint8_t reg_addr, uint8_t *data, size_t len)
-{
-    return i2c_master_transmit_receive(dev_handle, &reg_addr, 1, data, len, I2C_MASTER_TIMEOUT_MS);
-}
-
-/**
- * @brief Write two bytes to a MCP9808 sensor register
- */
-static esp_err_t mcp9808_register_write_word(i2c_master_dev_handle_t dev_handle, uint8_t reg_addr, uint16_t data)
-{
-    uint8_t write_buf[3] = {reg_addr, (uint8_t)(data >> 8), (uint8_t)(data & 0xFF)};
-    return i2c_master_transmit(dev_handle, write_buf, sizeof(write_buf), I2C_MASTER_TIMEOUT_MS);
-}
-
-/**
- * @brief Convert the raw MCP9808 ambient temperature register value to degrees Fahrenheit
- */
-static float mcp9808_raw_to_fahrenheit(uint16_t raw)
-{
-    /* Upper 3 bits are alert flags, remaining 13 bits are the signed temperature */
-    raw &= 0x1FFF;
-    float temp_c = (raw & 0x0FFF) / 16.0f;
-    if (raw & 0x1000) {
-        temp_c -= 256.0f;
-    }
-    return temp_c * 9.0f / 5.0f + 32.0f;
-}
-
-/**
- * @brief i2c master initialization
- */
-static void i2c_master_init(i2c_master_bus_handle_t *bus_handle, i2c_master_dev_handle_t *dev_handle)
-{
-    i2c_master_bus_config_t bus_config = {
-        .i2c_port = I2C_MASTER_NUM,
-        .sda_io_num = I2C_MASTER_SDA_IO,
-        .scl_io_num = I2C_MASTER_SCL_IO,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, bus_handle));
-
-    i2c_device_config_t dev_config = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = MCP9808_SENSOR_ADDR,
-        .scl_speed_hz = I2C_MASTER_FREQ_HZ,
-    };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(*bus_handle, &dev_config, dev_handle));
-}
-
-/**
  * @brief Log PoE Ethernet link/IP events
  */
 static void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -307,6 +245,7 @@ static void ethernet_init(void)
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
     esp_netif_t *eth_netif = esp_netif_new(&netif_cfg);
     ESP_ERROR_CHECK(esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle)));
+    ESP_ERROR_CHECK(esp_netif_set_hostname(eth_netif, DEVICE_HOSTNAME));
 
     ESP_ERROR_CHECK(esp_netif_dhcpc_stop(eth_netif));
     esp_netif_ip_info_t ip_info = { 0 };
@@ -316,6 +255,22 @@ static void ethernet_init(void)
     ESP_ERROR_CHECK(esp_netif_set_ip_info(eth_netif, &ip_info));
 
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
+
+    /* Advertise the hostname via mDNS so it shows up on network scans/browsers */
+    ESP_ERROR_CHECK(mdns_init());
+    ESP_ERROR_CHECK(mdns_hostname_set(DEVICE_HOSTNAME));
+    ESP_ERROR_CHECK(mdns_instance_name_set("ESP32-S3 Room Temperature" ));
+    ESP_ERROR_CHECK(mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0));
+    /* NetBIOS responder: shows the hostname in Windows Network view and most LAN scanners */
+    netbiosns_init();
+    netbiosns_set_name(DEVICE_HOSTNAME);}
+
+static esp_err_t favicon_get_handler(httpd_req_t *req)
+{
+    /* Avoid noisy 404 logs from browsers auto-requesting /favicon.ico */
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
 }
 
 static esp_err_t root_get_handler(httpd_req_t *req)
@@ -329,14 +284,14 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char resp[1024];
     int len = snprintf(resp, sizeof(resp),
         "<!DOCTYPE html><html><head>"
-        "<title>Room Temperature</title>"
+        "<title>Room Temperature 1</title>"
         "<style>body{font-family:sans-serif;text-align:center;margin-top:40px}"
         ".temp{font-size:64px}"
         ".btn{font-size:28px;padding:10px 26px;margin:10px;text-decoration:none;"
         "border:1px solid #333;border-radius:8px;display:inline-block;color:#000;"
         "background:none;cursor:pointer}</style>"
         "</head><body>"
-        "<h1>Room Temperature</h1>"
+        "<h1>Room Temperature 1</h1>"
         "<div class=\"temp\" id=\"temp\">%.2f&nbsp;&deg;F</div>"
         "<p>Calibration offset: <span id=\"offset\">%.2f</span>&nbsp;&deg;F</p>"
         "<button class=\"btn\" onclick=\"adjust('/dec')\">-</button>"
@@ -371,7 +326,7 @@ static esp_err_t api_temp_get_handler(httpd_req_t *req)
 static esp_err_t offset_inc_handler(httpd_req_t *req)
 {
     xSemaphoreTake(g_data_mutex, portMAX_DELAY);
-    g_offset_f += MCP9808_TEMP_OFFSET_STEP_F;
+    g_offset_f += DS18B20_TEMP_OFFSET_STEP_F;
     xSemaphoreGive(g_data_mutex);
     return api_temp_get_handler(req);
 }
@@ -379,7 +334,7 @@ static esp_err_t offset_inc_handler(httpd_req_t *req)
 static esp_err_t offset_dec_handler(httpd_req_t *req)
 {
     xSemaphoreTake(g_data_mutex, portMAX_DELAY);
-    g_offset_f -= MCP9808_TEMP_OFFSET_STEP_F;
+    g_offset_f -= DS18B20_TEMP_OFFSET_STEP_F;
     xSemaphoreGive(g_data_mutex);
     return api_temp_get_handler(req);
 }
@@ -445,15 +400,19 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
 static void start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    /* Close the oldest idle connection instead of refusing new ones once max_open_sockets is hit */
+    config.lru_purge_enable = true;
     httpd_handle_t server = NULL;
     ESP_ERROR_CHECK(httpd_start(&server, &config));
 
     const httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
+    const httpd_uri_t favicon_uri = { .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_get_handler };
     const httpd_uri_t api_temp_uri = { .uri = "/api/temp", .method = HTTP_GET, .handler = api_temp_get_handler };
     const httpd_uri_t inc_uri = { .uri = "/inc", .method = HTTP_GET, .handler = offset_inc_handler };
     const httpd_uri_t dec_uri = { .uri = "/dec", .method = HTTP_GET, .handler = offset_dec_handler };
     const httpd_uri_t ota_uri = { .uri = "/ota", .method = HTTP_POST, .handler = ota_post_handler };
     httpd_register_uri_handler(server, &root_uri);
+    httpd_register_uri_handler(server, &favicon_uri);
     httpd_register_uri_handler(server, &api_temp_uri);
     httpd_register_uri_handler(server, &inc_uri);
     httpd_register_uri_handler(server, &dec_uri);
@@ -462,9 +421,18 @@ static void start_webserver(void)
 
 void app_main(void)
 {
-    uint8_t data[2];
-    i2c_master_bus_handle_t bus_handle;
-    i2c_master_dev_handle_t dev_handle;
+    onewire_bus_handle_t bus;
+    onewire_bus_config_t bus_config = {
+        .bus_gpio_num = DS18B20_GPIO,
+        .flags.en_pull_up = true,
+    };
+    onewire_bus_rmt_config_t rmt_config = {
+        .max_rx_bytes = 10,
+    };
+    ds18b20_device_handle_t sensor;
+    onewire_device_iter_handle_t iter = NULL;
+    onewire_device_t device;
+    esp_err_t search_result;
 
     g_data_mutex = xSemaphoreCreateMutex();
 
@@ -472,40 +440,42 @@ void app_main(void)
     start_telnet_server();
     start_webserver();
 
-    i2c_master_init(&bus_handle, &dev_handle);
-    ESP_LOGI(TAG, "I2C initialized successfully");
+    ESP_ERROR_CHECK(onewire_new_bus_rmt(&bus_config, &rmt_config, &bus));
+    ESP_LOGI(TAG, "1-Wire bus initialized on GPIO%d", DS18B20_GPIO);
 
-    /* Read the MCP9808 Manufacturer ID register, expected value is 0x0054 */
-    ESP_ERROR_CHECK(mcp9808_register_read(dev_handle, MCP9808_REG_MANUF_ID, data, 2));
-    uint16_t manuf_id = (data[0] << 8) | data[1];
-    ESP_LOGI(TAG, "Manufacturer ID = 0x%04X", manuf_id);
-
-    /* Read the MCP9808 Device ID register, expected value is 0x04 */
-    ESP_ERROR_CHECK(mcp9808_register_read(dev_handle, MCP9808_REG_DEVICE_ID, data, 2));
-    ESP_LOGI(TAG, "Device ID = 0x%02X, Revision = 0x%02X", data[0], data[1]);
-
-    /* Ensure the device is in continuous conversion mode (default config) */
-    ESP_ERROR_CHECK(mcp9808_register_write_word(dev_handle, MCP9808_REG_CONFIG, 0x0000));
+    ESP_ERROR_CHECK(onewire_new_device_iter(bus, &iter));
+    do {
+        search_result = onewire_device_iter_get_next(iter, &device);
+        if (search_result == ESP_OK &&
+            ds18b20_new_device_from_enumeration(&device, &(ds18b20_config_t){}, &sensor) == ESP_OK) {
+            break;
+        }
+    } while (search_result != ESP_ERR_NOT_FOUND);
+    ESP_ERROR_CHECK(onewire_del_device_iter(iter));
+    ESP_ERROR_CHECK(search_result == ESP_OK ? ESP_OK : ESP_ERR_NOT_FOUND);
+    ESP_ERROR_CHECK(ds18b20_set_resolution(sensor, DS18B20_RESOLUTION_12B));
+    ESP_LOGI(TAG, "DS18B20 sensor found");
 
     float temp_sum_f = 0.0f;
     int sample_count = 0;
 
     while (1) {
-        ESP_ERROR_CHECK(mcp9808_register_read(dev_handle, MCP9808_REG_TEMP_AMBIENT, data, 2));
-        uint16_t raw_temp = (data[0] << 8) | data[1];
+        ESP_ERROR_CHECK(ds18b20_trigger_temperature_conversion_for_all(bus));
+        float temp_c;
+        ESP_ERROR_CHECK(ds18b20_get_temperature(sensor, &temp_c));
 
         xSemaphoreTake(g_data_mutex, portMAX_DELAY);
         float offset_f = g_offset_f;
         xSemaphoreGive(g_data_mutex);
 
-        float temp_f = mcp9808_raw_to_fahrenheit(raw_temp) + offset_f;
+        float temp_f = temp_c * 9.0f / 5.0f + 32.0f + offset_f;
 
         temp_sum_f += temp_f;
         sample_count++;
 
         if (sample_count >= SAMPLES_PER_AVERAGE) {
             float temp_avg_f = temp_sum_f / sample_count;
-            ESP_LOGI(TAG, "Room Temp. (avg) = %.2f F", temp_avg_f);
+            ESP_LOGI(TAG, "Room Temp. 1 (avg) = %.2f F", temp_avg_f);
 
             xSemaphoreTake(g_data_mutex, portMAX_DELAY);
             g_temp_f = temp_avg_f;

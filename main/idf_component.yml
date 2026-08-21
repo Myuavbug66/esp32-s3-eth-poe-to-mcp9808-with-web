@@ -1,2 +1,5 @@
 dependencies:
   espressif/w5500: "^2.0.0"
+  espressif/onewire_bus: "^1.1.1"
+  espressif/ds18b20: "^0.4.0"
+  espressif/mdns: "^1.2.0"

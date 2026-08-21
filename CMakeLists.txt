@@ -3,4 +3,4 @@
 cmake_minimum_required(VERSION 3.22)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(esp32-s3-eth-to-mcp9808-temp-001)
+project(esp32-s3-eth-to-ds18b20-temp-001)

@@ -1,7 +1,7 @@
-# ESP32-S3 PoE MCP9808 Temperature Monitor
+# ESP32-S3 PoE DS18B20 Temperature Monitor
 
 This project targets the ESP32-S3-ETH-PoE board. The W5500 Ethernet interface
-provides the network connection and the MCP9808 sensor is read over I2C. The
+provides the network connection and the DS18B20 sensor is read over 1-Wire. The
 web temperature page is served over the PoE Ethernet connection at the static
 IP configured in `sdkconfig`.
 
@@ -14,7 +14,7 @@ Flash this OTA-enabled version once over USB. Future firmware binaries can be
 uploaded over PoE Ethernet with PowerShell:
 
 ```powershell
-Invoke-WebRequest -Uri http://192.168.1.136/ota -Method Post -InFile build/esp32-s3-eth-to-mcp9808-temp-001.bin -ContentType application/octet-stream
+Invoke-WebRequest -Uri http://192.168.1.136/ota -Method Post -InFile build/esp32-s3-eth-to-ds18b20-temp-001.bin -ContentType application/octet-stream
 ```
 
 The board reboots automatically after a successful upload. Keep the computer
