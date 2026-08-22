@@ -44,11 +44,13 @@ static const char *TAG = "ds18b20";
 #define DS18B20_TEMP_OFFSET_STEP_F     0.1f
 #define SAMPLE_INTERVAL_MS          1000        /*!< Time between sensor reads */
 #define SAMPLES_PER_AVERAGE         5           /*!< Number of reads averaged into each logged value (5 sec) */
+#define MAX_DS18B20_SENSORS         2
 
 /* Shared temperature/offset state, protected by g_data_mutex since it is written
  * from the sensor task and read/written from HTTP server request handlers. */
 static SemaphoreHandle_t g_data_mutex;
 static float g_temp_f = 0.0f;
+static float g_temp2_f = 0.0f;
 static float g_offset_f = DS18B20_TEMP_OFFSET_F_DEFAULT;
 static SemaphoreHandle_t g_telnet_mutex;
 static int g_telnet_client = -1;
@@ -275,50 +277,55 @@ static esp_err_t favicon_get_handler(httpd_req_t *req)
 
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
-    float temp_f, offset_f;
+    float temp_f, temp2_f, offset_f;
     xSemaphoreTake(g_data_mutex, portMAX_DELAY);
     temp_f = g_temp_f;
+    temp2_f = g_temp2_f;
     offset_f = g_offset_f;
     xSemaphoreGive(g_data_mutex);
 
-    char resp[1024];
+    char resp[4096];
     int len = snprintf(resp, sizeof(resp),
         "<!DOCTYPE html><html><head>"
-        "<title>Room Temperature 1</title>"
+        "<title>Room Temperatures 1</title>"
         "<style>body{font-family:sans-serif;text-align:center;margin-top:40px}"
         ".temp{font-size:64px}"
         ".btn{font-size:28px;padding:10px 26px;margin:10px;text-decoration:none;"
         "border:1px solid #333;border-radius:8px;display:inline-block;color:#000;"
         "background:none;cursor:pointer}</style>"
         "</head><body>"
-        "<h1>Room Temperature 1</h1>"
-        "<div class=\"temp\" id=\"temp\">%.2f&nbsp;&deg;F</div>"
+        "<h1>Room Temperatures 1</h1>"
+        "<h2>Sensor 1</h2><div class=\"temp\" id=\"temp\">%.2f&nbsp;&deg;F</div>"
+        "<h2>Sensor 2</h2><div class=\"temp\" id=\"temp2\">%.2f&nbsp;&deg;F</div>"
         "<p>Calibration offset: <span id=\"offset\">%.2f</span>&nbsp;&deg;F</p>"
         "<button class=\"btn\" onclick=\"adjust('/dec')\">-</button>"
         "<button class=\"btn\" onclick=\"adjust('/inc')\">+</button>"
         "<script>"
         "function update(d){document.getElementById('temp').innerHTML=d.temp_f.toFixed(2)+'&nbsp;&deg;F';"
+        "document.getElementById('temp2').innerHTML=d.temp2_f.toFixed(2)+'&nbsp;&deg;F';"
         "document.getElementById('offset').textContent=d.offset_f.toFixed(2);}"
         "function poll(){fetch('/api/temp').then(r=>r.json()).then(update);}"
         "function adjust(url){fetch(url).then(r=>r.json()).then(update);}"
         "setInterval(poll,2000);"
         "</script>"
         "</body></html>",
-        temp_f, offset_f);
+        temp_f, temp2_f, offset_f);
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, resp, len);
 }
 
 static esp_err_t api_temp_get_handler(httpd_req_t *req)
 {
-    float temp_f, offset_f;
+    float temp_f, temp2_f, offset_f;
     xSemaphoreTake(g_data_mutex, portMAX_DELAY);
     temp_f = g_temp_f;
+    temp2_f = g_temp2_f;
     offset_f = g_offset_f;
     xSemaphoreGive(g_data_mutex);
 
-    char resp[128];
-    int len = snprintf(resp, sizeof(resp), "{\"temp_f\":%.2f,\"offset_f\":%.2f}", temp_f, offset_f);
+    char resp[160];
+    int len = snprintf(resp, sizeof(resp), "{\"temp_f\":%.2f,\"temp2_f\":%.2f,\"offset_f\":%.2f}",
+                       temp_f, temp2_f, offset_f);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, resp, len);
 }
@@ -429,7 +436,8 @@ void app_main(void)
     onewire_bus_rmt_config_t rmt_config = {
         .max_rx_bytes = 10,
     };
-    ds18b20_device_handle_t sensor;
+    ds18b20_device_handle_t sensors[MAX_DS18B20_SENSORS];
+    int sensor_count = 0;
     onewire_device_iter_handle_t iter = NULL;
     onewire_device_t device;
     esp_err_t search_result;
@@ -446,42 +454,55 @@ void app_main(void)
     ESP_ERROR_CHECK(onewire_new_device_iter(bus, &iter));
     do {
         search_result = onewire_device_iter_get_next(iter, &device);
-        if (search_result == ESP_OK &&
-            ds18b20_new_device_from_enumeration(&device, &(ds18b20_config_t){}, &sensor) == ESP_OK) {
-            break;
+        if (search_result == ESP_OK && sensor_count < MAX_DS18B20_SENSORS &&
+            ds18b20_new_device_from_enumeration(&device, &(ds18b20_config_t){},
+                                                &sensors[sensor_count]) == ESP_OK) {
+            ESP_ERROR_CHECK(ds18b20_set_resolution(sensors[sensor_count], DS18B20_RESOLUTION_12B));
+            sensor_count++;
         }
     } while (search_result != ESP_ERR_NOT_FOUND);
     ESP_ERROR_CHECK(onewire_del_device_iter(iter));
-    ESP_ERROR_CHECK(search_result == ESP_OK ? ESP_OK : ESP_ERR_NOT_FOUND);
-    ESP_ERROR_CHECK(ds18b20_set_resolution(sensor, DS18B20_RESOLUTION_12B));
-    ESP_LOGI(TAG, "DS18B20 sensor found");
+    ESP_ERROR_CHECK(sensor_count > 0 ? ESP_OK : ESP_ERR_NOT_FOUND);
+    ESP_LOGI(TAG, "%d DS18B20 sensor%s found", sensor_count, sensor_count == 1 ? "" : "s");
 
-    float temp_sum_f = 0.0f;
+    float temp_sum_f[MAX_DS18B20_SENSORS] = { 0 };
     int sample_count = 0;
 
     while (1) {
         ESP_ERROR_CHECK(ds18b20_trigger_temperature_conversion_for_all(bus));
-        float temp_c;
-        ESP_ERROR_CHECK(ds18b20_get_temperature(sensor, &temp_c));
+        float temp_f[MAX_DS18B20_SENSORS];
 
         xSemaphoreTake(g_data_mutex, portMAX_DELAY);
         float offset_f = g_offset_f;
         xSemaphoreGive(g_data_mutex);
 
-        float temp_f = temp_c * 9.0f / 5.0f + 32.0f + offset_f;
+        for (int sensor_index = 0; sensor_index < sensor_count; sensor_index++) {
+            float temp_c;
+            ESP_ERROR_CHECK(ds18b20_get_temperature(sensors[sensor_index], &temp_c));
+            temp_f[sensor_index] = temp_c * 9.0f / 5.0f + 32.0f + offset_f;
+            temp_sum_f[sensor_index] += temp_f[sensor_index];
+        }
 
-        temp_sum_f += temp_f;
         sample_count++;
 
         if (sample_count >= SAMPLES_PER_AVERAGE) {
-            float temp_avg_f = temp_sum_f / sample_count;
-            ESP_LOGI(TAG, "Room Temp. 1 (avg) = %.2f F", temp_avg_f);
+            float temp_avg_f[MAX_DS18B20_SENSORS];
+            for (int sensor_index = 0; sensor_index < sensor_count; sensor_index++) {
+                temp_avg_f[sensor_index] = temp_sum_f[sensor_index] / sample_count;
+            }
+            ESP_LOGI(TAG, "Room Temp. 1 (avg) = %.2f F", temp_avg_f[0]);
+            if (sensor_count > 1) {
+                ESP_LOGI(TAG, "Room Temp. 2 (avg) = %.2f F", temp_avg_f[1]);
+            }
 
             xSemaphoreTake(g_data_mutex, portMAX_DELAY);
-            g_temp_f = temp_avg_f;
+            g_temp_f = temp_avg_f[0];
+            g_temp2_f = sensor_count > 1 ? temp_avg_f[1] : 0.0f;
             xSemaphoreGive(g_data_mutex);
 
-            temp_sum_f = 0.0f;
+            for (int sensor_index = 0; sensor_index < sensor_count; sensor_index++) {
+                temp_sum_f[sensor_index] = 0.0f;
+            }
             sample_count = 0;
         }
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_INTERVAL_MS));
